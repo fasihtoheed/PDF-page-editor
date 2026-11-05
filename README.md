@@ -5,7 +5,7 @@ This is basically built for students in courses such as GCE Alevels,GCE Olevels,
 
 HOW TO USE:
 
-Copy paste the code from the file called Main-code after installing all the required libraries i.e (PyQt6 and PyMuPDF) libraries once you have installed them in the terminal in which you will run the code paste the code into your any python editor and click on Run.
+Copy paste the code from the file called Main-code after installing all the required libraries i.e (PyQt6 and PyMuPDF Libraries) once you have installed them in the terminal in which you will run the code paste the code into your any python editor and click on Run.
 
 A popup window will appear showing buttons like "open pdfs,create new pdf" etc. Select the option of create new pdf selecting its location and name, repeat the process for another pdf naming it for e.g Markscheme of the question paper that you are about to make once you have made these 2 pdfs now open all your required pdfs (i would prefer opening less files at instant like 8-10 files in one go) to prevent the processor from lagging.
 
