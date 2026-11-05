@@ -1,0 +1,366 @@
+"""
+Install:   pip install PyQt6 PyMuPDF
+Run:       python topical_pdf_builder.py
+"""
+import sys
+import fitz  # PyMuPDF
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QFont, QKeySequence, QShortcut
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QScrollArea, QTabWidget, QPushButton, QFileDialog, QMessageBox,
+    QListWidget, QListWidgetItem, QDockWidget,
+)
+
+COLORS = {"A": QColor(0, 120, 215), "B": QColor(230, 120, 0)}
+PREV = "prev::"  # prefix for pages that were already inside a continued PDF
+
+
+def short(path):
+    return path.replace("\\", "/").split("/")[-1]
+
+
+class Collection:
+    """One output PDF: a save path and an ordered list of (source_key, page_no)."""
+
+    def __init__(self, slot, path):
+        self.slot, self.path, self.pages = slot, path, []
+
+    def has(self, src, pno):
+        return (src, pno) in self.pages
+
+
+class PageLabel(QLabel):
+    """A single rendered PDF page. Handles modifier-clicks."""
+
+    def __init__(self, viewer, pno, pixmap):
+        super().__init__()
+        self.viewer, self.pno = viewer, pno
+        self.setPixmap(pixmap)
+        # size in logical pixels (the pixmap itself may have extra pixels for sharpness)
+        self.setFixedSize(pixmap.deviceIndependentSize().toSize())
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        m = e.modifiers()
+        ctrl = bool(m & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(m & Qt.KeyboardModifier.ShiftModifier)
+        alt = bool(m & Qt.KeyboardModifier.AltModifier)
+        if ctrl:
+            self.viewer.window_ref.handle_click(self.viewer, self.pno, "B" if shift else "A", remove=alt)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        src = self.viewer.path
+        p = QPainter(self)
+        x = self.width() - 10
+        for slot, col in self.viewer.window_ref.collections.items():
+            if col.has(src, self.pno):
+                c = COLORS[slot]
+                p.setPen(c)
+                p.setBrush(c)
+                x -= 34
+                p.drawRoundedRect(x, 8, 30, 24, 6, 6)
+                p.setPen(QColor("white"))
+                p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                p.drawText(x, 8, 30, 24, Qt.AlignmentFlag.AlignCenter, slot)
+        p.end()
+
+
+class PdfViewer(QScrollArea):
+    """Continuous vertical page view, similar to Edge's PDF reader."""
+
+    def __init__(self, path, window_ref):
+        super().__init__()
+        self.path, self.window_ref = path, window_ref
+        self.doc = fitz.open(path)
+        self.zoom = 1.33  # same size as Edge at 100%
+        self.target_zoom = self.zoom
+        self.labels = []
+        self.setWidgetResizable(True)
+        self.setStyleSheet("background:#525659;")
+
+        # zoom is applied after a short pause so fast scrolling stays smooth
+        self.zoom_timer = QTimer(self)
+        self.zoom_timer.setSingleShot(True)
+        self.zoom_timer.timeout.connect(self.apply_zoom)
+
+        self.render_pages()
+
+    # ----- rendering -----
+    def render_pages(self):
+        bar = self.verticalScrollBar()
+        frac = bar.value() / bar.maximum() if bar.maximum() else 0.0
+
+        host = QWidget()
+        lay = QVBoxLayout(host)
+        lay.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lay.setSpacing(12)
+        self.labels = []
+        # Render at the screen's real pixel density (Windows display scaling of 125%/150%
+        # would otherwise stretch a low-res image and make it blurry). Capped to save memory.
+        dpr = max(1.0, self.devicePixelRatioF())
+        scale = min(self.zoom * dpr, 4.0)
+        mat = fitz.Matrix(scale, scale)
+        for i, page in enumerate(self.doc):
+            pm = page.get_pixmap(matrix=mat, alpha=False)
+            img = QImage(pm.samples, pm.width, pm.height, pm.stride, QImage.Format.Format_RGB888).copy()
+            qpm = QPixmap.fromImage(img)
+            qpm.setDevicePixelRatio(scale / self.zoom)  # logical size stays = zoom * 72dpi
+            lbl = PageLabel(self, i, qpm)
+            lay.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
+            self.labels.append(lbl)
+        self.setWidget(host)
+        # keep the same relative position after re-rendering (layout needs a moment)
+        QTimer.singleShot(30, lambda: bar.setValue(int(frac * bar.maximum())))
+
+    def refresh(self):
+        for l in self.labels:
+            l.update()
+
+    # ----- zoom -----
+    def zoom_by(self, delta):
+        self.target_zoom = max(0.4, min(3.0, self.target_zoom + delta))
+        self.zoom_timer.start(120)
+
+    def apply_zoom(self):
+        if abs(self.target_zoom - self.zoom) > 1e-3:
+            self.zoom = self.target_zoom
+            self.render_pages()
+
+    def wheelEvent(self, e):
+        if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            steps = e.angleDelta().y() / 120.0
+            self.zoom_by(0.1 * steps)
+            e.accept()
+        else:
+            super().wheelEvent(e)
+
+    # ----- page navigation -----
+    def current_page(self):
+        v = self.verticalScrollBar().value()
+        cur = 0
+        for i, l in enumerate(self.labels):
+            if l.y() <= v + 20:
+                cur = i
+        return cur
+
+    def goto(self, i):
+        if not self.labels:
+            return
+        i = max(0, min(len(self.labels) - 1, i))
+        self.verticalScrollBar().setValue(self.labels[i].y() - 6)
+
+    def next_page(self):
+        self.goto(self.current_page() + 1)
+
+    def prev_page(self):
+        cur = self.current_page()
+        v = self.verticalScrollBar().value()
+        # if we're partway down a page, first jump to its top; otherwise go to the previous page
+        if self.labels and v > self.labels[cur].y() + 40:
+            self.goto(cur)
+        else:
+            self.goto(cur - 1)
+
+
+class Main(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Topical Past Paper Builder")
+        self.resize(1200, 850)
+        self.collections = {}   # "A"/"B" -> Collection
+        self.sources = {}       # source key -> fitz.Document (kept open for copying pages)
+
+        top = QWidget()
+        row = QHBoxLayout(top)
+        row.setContentsMargins(6, 6, 6, 6)
+        for text, fn in [("Open PDFs…", self.open_pdfs), ("Generate new PDF", self.new_pdf),
+                         ("Zoom +", lambda: self.zoom(0.15)), ("Zoom −", lambda: self.zoom(-0.15))]:
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch()
+        self.hint = QLabel("Ctrl+Click → A  |  Ctrl+Shift+Click → B  |  +Alt = remove  |  ← → pages  |  Ctrl+Scroll = zoom")
+        row.addWidget(self.hint)
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.tabCloseRequested.connect(self.tabs.removeTab)
+
+        central = QWidget()
+        v = QVBoxLayout(central)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(top)
+        v.addWidget(self.tabs)
+        self.setCentralWidget(central)
+
+        self.panel = QListWidget()
+        dock = QDockWidget("New PDFs (Delete key removes selected)", self)
+        dock.setWidget(self.panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+        QShortcut(QKeySequence("Ctrl+O"), self, self.open_pdfs)
+        QShortcut(QKeySequence("Ctrl+N"), self, self.new_pdf)
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self.nav("next"))
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.nav("prev"))
+        QShortcut(QKeySequence("Ctrl+="), self, lambda: self.zoom(0.1))
+        QShortcut(QKeySequence("Ctrl++"), self, lambda: self.zoom(0.1))
+        QShortcut(QKeySequence("Ctrl+-"), self, lambda: self.zoom(-0.1))
+        sc = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.panel, self.delete_selected)
+        sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        self.statusBar().showMessage("Open some PDFs, then click 'Generate new PDF'.")
+
+    # ---------- viewing ----------
+    def open_pdfs(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Open PDFs", "", "PDF files (*.pdf)")
+        for f in files:
+            try:
+                viewer = PdfViewer(f, self)
+            except Exception as ex:
+                QMessageBox.warning(self, "Error", f"Could not open {f}\n{ex}")
+                continue
+            self.sources[f] = viewer.doc
+            self.tabs.addTab(viewer, short(f))
+            self.tabs.setCurrentWidget(viewer)
+
+    def zoom(self, delta):
+        v = self.tabs.currentWidget()
+        if v:
+            v.zoom_by(delta)
+
+    def nav(self, which):
+        v = self.tabs.currentWidget()
+        if v:
+            v.next_page() if which == "next" else v.prev_page()
+
+    # ---------- creating / continuing an output PDF ----------
+    def new_pdf(self):
+        free = [s for s in ("A", "B") if s not in self.collections]
+        if free:
+            slot = free[0]
+        else:
+            r = QMessageBox.question(
+                self, "Both slots used",
+                "A and B already exist.\nStart another PDF in slot A (A's file stays saved)?",
+            )
+            if r != QMessageBox.StandardButton.Yes:
+                return
+            slot = "A"
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Generate new PDF")
+        box.setText(f"Set up PDF {slot}:")
+        b_new = box.addButton("Create a new PDF", QMessageBox.ButtonRole.AcceptRole)
+        b_old = box.addButton("Continue an existing PDF", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked == b_new:
+            path, _ = QFileDialog.getSaveFileName(self, f"Name for new PDF ({slot})", "", "PDF files (*.pdf)")
+            if not path:
+                return
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            col = Collection(slot, path)
+            msg = f"PDF {slot} = {path}."
+        elif clicked == b_old:
+            path, _ = QFileDialog.getOpenFileName(self, f"Choose the PDF to continue ({slot})", "", "PDF files (*.pdf)")
+            if not path:
+                return
+            try:
+                # read it fully into memory so the file itself is never locked
+                with open(path, "rb") as fh:
+                    old = fitz.open(stream=fh.read(), filetype="pdf")
+            except Exception as ex:
+                QMessageBox.warning(self, "Error", f"Could not open {path}\n{ex}")
+                return
+            key = PREV + path
+            self.sources[key] = old
+            col = Collection(slot, path)
+            col.pages = [(key, i) for i in range(len(old))]
+            msg = f"Continuing {short(path)} ({len(old)} existing pages) as PDF {slot}."
+        else:
+            return
+
+        self.collections[slot] = col
+        self.refresh_panel()
+        self.statusBar().showMessage(
+            msg + f"  Use {'Ctrl' if slot == 'A' else 'Ctrl+Shift'}+Click on pages to add."
+        )
+
+    # ---------- clicking pages ----------
+    def handle_click(self, viewer, pno, slot, remove=False):
+        col = self.collections.get(slot)
+        if col is None:
+            self.statusBar().showMessage(f"No PDF '{slot}' yet – click 'Generate new PDF' first.")
+            return
+        key = (viewer.path, pno)
+        if remove:
+            if key in col.pages:
+                col.pages.remove(key)
+        elif key in col.pages:
+            self.statusBar().showMessage(f"Page {pno + 1} is already in {slot}.")
+            return
+        else:
+            col.pages.append(key)
+        self.after_change(col, f"{'Removed from' if remove else 'Added to'} {slot}: page {pno + 1}")
+
+    def delete_selected(self):
+        item = self.panel.currentItem()
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not data:
+            return
+        slot, idx = data
+        col = self.collections.get(slot)
+        if col and 0 <= idx < len(col.pages):
+            del col.pages[idx]
+            self.after_change(col, f"Removed item {idx + 1} from {slot}")
+
+    def after_change(self, col, text):
+        self.save(col)
+        self.refresh_panel()
+        for i in range(self.tabs.count()):
+            self.tabs.widget(i).refresh()
+        self.statusBar().showMessage(f"{text}  ({len(col.pages)} pages total)")
+
+    def save(self, col):
+        out = fitz.open()
+        for src, pno in col.pages:
+            out.insert_pdf(self.sources[src], from_page=pno, to_page=pno)
+        try:
+            if len(out):
+                out.save(col.path, garbage=3, deflate=True)
+        except Exception as ex:
+            QMessageBox.warning(
+                self, "Save failed",
+                f"{col.path}\n{ex}\n\nClose this file if it is open in another program or in a tab here.",
+            )
+        out.close()
+
+    def refresh_panel(self):
+        self.panel.clear()
+        for slot, col in self.collections.items():
+            head = QListWidgetItem(f"[{slot}] {short(col.path)}  ({len(col.pages)})")
+            head.setForeground(COLORS[slot])
+            f = head.font()
+            f.setBold(True)
+            head.setFont(f)
+            self.panel.addItem(head)
+            for n, (src, pno) in enumerate(col.pages):
+                if src.startswith(PREV):
+                    label = f"   {n + 1}. (earlier) p{pno + 1}"
+                else:
+                    label = f"   {n + 1}. {short(src)} – p{pno + 1}"
+                it = QListWidgetItem(label)
+                it.setData(Qt.ItemDataRole.UserRole, (slot, n))
+                self.panel.addItem(it)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    w = Main()
+    w.show()
+    sys.exit(app.exec())
